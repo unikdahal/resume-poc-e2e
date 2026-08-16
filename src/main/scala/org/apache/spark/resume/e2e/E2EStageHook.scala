@@ -49,7 +49,16 @@ class E2EStageHook(
     sc: SparkContext,
     store: AnchorStore,
     queryId: String,
-    mode: HookMode) extends StageResumeHook with Logging {
+    mode: HookMode,
+    // Fires synchronously right after a stage is successfully adopted (confirmAlive/confirmFresh/
+    // adopt all passed, tracker seeded), BEFORE returning Some(stats) to AdaptiveSparkPlanExec.
+    // Exists for `Demo.scala`'s `adopt-kill-before-fetch` mode: AQE's own materialization loop
+    // calls tryAdoptShuffleStage synchronously and blocks on its return, so pausing HERE is the
+    // AQE-pipeline equivalent of resume-poc's RDD-level demo pausing between `tryAdopt` and
+    // `.collect()` -- there is no other synchronous point available between "adoption decided"
+    // and "downstream tasks may start reading" once AQE is driving instead of a hand-written
+    // RDD pipeline. Default no-op so every other mode pays nothing for this.
+    onAdopted: () => Unit = () => ()) extends StageResumeHook with Logging {
 
   private val SCHEMA_VERSION = "resume-poc-e2e-1"
   private val knownDigests = mutable.Map[Int, String]()
@@ -160,6 +169,7 @@ class E2EStageHook(
       s"celebornShuffleId=${anchor.celebornShuffleId} bytesByPartitionId=${stats.bytesByPartitionId.mkString(",")} " +
       s"dataSize=${anchor.dataSize} rowCount=${anchor.rowCount}")
     record(StageAdopted(newShuffleId, digest))
+    onAdopted()
     Some(stats)
   }
 

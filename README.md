@@ -10,10 +10,10 @@ underneath it, because a real `StageDigest` matched. This project is that combin
 
 ## What this proves
 
-Run `./run-e2e-demo.sh` (needs `../spark` built as `3.5.10-SNAPSHOT` and `../celeborn` built as
-`1.0.0-SNAPSHOT` -- see `pom.xml`'s header comment for the exact build commands, same
-prerequisites `resume-poc` and `resume-poc-sql` each already need separately). 9/9 checks pass,
-two query shapes:
+Run `./run-e2e-demo.sh` (9/9 checks, two query shapes) and `./run-e2e-kill-test.sh` (2/2 checks,
+a third scenario) -- both need `../spark` built as `3.5.10-SNAPSHOT` and `../celeborn` built as
+`1.0.0-SNAPSHOT` (see `pom.xml`'s header comment for the exact build commands, same prerequisites
+`resume-poc` and `resume-poc-sql` each already need separately):
 
 1. **Correctness.** The adopted run's result matches an independently (non-Spark) computed
    expected value.
@@ -47,6 +47,18 @@ two query shapes:
    ADOPTED stage using `MapOutputTrackerAccess.seedAdopted`'s fabricated per-mapper stats; (c) the
    result is still correct. (b) failed the first time this was run -- see the bug below -- and (c)
    would have been meaningless if (b) hadn't first been forced to genuinely happen.
+7. **Fetch-failure recovery holds for an adopted AQE stage too -- checked, not assumed to be the
+   same as the RDD case (`run-e2e-kill-test.sh`, 2/2 checks, reproduced twice).** An adopted
+   `ShuffleQueryStageExec`'s `resultOption` is frozen and everything downstream has already been
+   replanned around it before any real reduce task exists -- and its "map tasks" were never part
+   of any `submitMapStage` call, only ever registered directly on `MapOutputTrackerMaster`. Adopt
+   for real (worker genuinely alive), pause synchronously inside the hook itself right after
+   adoption (`E2EStageHook`'s `onAdopted` callback -- the only synchronous point AQE's own
+   driver-side loop offers, unlike the RDD demo which can pause between `tryAdopt` and
+   `.collect()` directly), kill the worker holding the adopted data, then let AQE resume. Spark's
+   own unmodified fetch-failure handling resubmits the real map tasks and recomputes correctly --
+   confirming the mechanism generalizes to a case this project's own design note didn't originally
+   claim was equivalent.
 
 ## Three real bugs found building this, not anticipated by design
 
@@ -118,13 +130,7 @@ doc comment in `../spark`) -- summarized here:
   or fail rung 7.5 later (safe under A-1, not silently wrong) -- but a capture that always times
   out would silently never contribute a usable anchor, and nothing here alerts on that pattern
   specifically.
-- **Real crash/restart across separate host processes is not exercised here** the way
-  `resume-poc`'s two-JVM `run-demo.sh` does (`capture`/`adopt` are still two separate `java`
-  invocations here too, same as every other demo in this project -- but this project has not
-  added its own kill-mid-flight test the way `resume-poc/run-kill-before-fetch-test.sh` did; that
-  test's finding -- Spark's own fetch-failure recovery is the real safety net -- is inherited by
-  construction (same underlying mechanism) but not re-verified against this specific SQL/AQE
-  pipeline.
+- Kill-mid-flight was on this list; it's closed now (`run-e2e-kill-test.sh`, item 7 above).
 - **Two query shapes now (a groupBy/join with differing downstream strategy, and a skewed join),
   one hook implementation, one small local cluster.** Not a stress test, not a real multi-stage
   query with many simultaneously-adoptable stages, not a load test of `BATCH_OPEN_STREAM` fan-out

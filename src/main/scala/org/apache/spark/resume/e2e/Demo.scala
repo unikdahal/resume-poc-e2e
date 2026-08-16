@@ -162,7 +162,7 @@ object Demo {
   }
 
   def main(args: Array[String]): Unit = {
-    val mode = args(0) // setup | capture | adopt | adopt-cold | skew-capture | skew-adopt
+    val mode = args(0) // setup | capture | adopt | adopt-cold | skew-capture | skew-adopt | adopt-kill-before-fetch
     val base = args(1)
     // args(2) is the anchor-store directory, required for capture/adopt (setup writes no
     // anchors and doesn't need one). args(3), if present, overrides the Celeborn master
@@ -325,6 +325,55 @@ object Demo {
             "-- this is the failure mode this scenario exists to catch: a skew-split read against " +
             "an adopted stage's fabricated per-mapper stats producing a wrong answer")
           println(s"RESUME-POC-E2E SKEW-ADOPT result=OK count=$count")
+        } finally {
+          hook.close()
+          ResumeHooks.stage = None
+          spark.stop()
+        }
+
+      // Residual-risk test (design-aqe-and-corrupted-rerun.md S2), the AQE-pipeline sibling of
+      // resume-poc's run-kill-before-fetch-test.sh -- and NOT obviously the same test, checked
+      // rather than assumed: an adopted ShuffleQueryStageExec's `resultOption` is already frozen
+      // (`StageSuccess` synthesized, `stage.cleanupResources()` called) by the time AQE finishes
+      // replanning everything downstream of it, all before a single real reduce task exists. Does
+      // Spark's fetch-failure recovery still correctly resubmit and recompute that stage's REAL
+      // map tasks -- which, unlike the RDD case, were never part of any `submitMapStage` call at
+      // all, only ever registered directly on `MapOutputTrackerMaster` -- when the worker holding
+      // the adopted data dies before the join ever reads it? `onAdopted` (see `E2EStageHook`'s
+      // constructor doc) is the only synchronous pause point AQE's own driver-side loop offers;
+      // signalling ready and blocking there is the AQE equivalent of resume-poc's demo pausing
+      // between `tryAdopt` and `.collect()`.
+      case "adopt-kill-before-fetch" =>
+        val store = new FileAnchorStore(new File(args(2)))
+        val readySignal = new File(args(4))
+        val killSignal = new File(args(5))
+        val spark = newSession(base, masterEndpoint, QUERY_ID, autoBroadcastThreshold = 10L * 1024 * 1024)
+        val onAdopted = () => {
+          readySignal.getParentFile.mkdirs()
+          val w = new java.io.PrintWriter(readySignal)
+          try { w.write("ready") } finally { w.close() }
+          println("RESUME-POC-E2E RUN-KILL signalled ready -- waiting for worker-killed signal")
+          val deadline = System.currentTimeMillis() + 30000
+          while (!killSignal.exists() && System.currentTimeMillis() < deadline) Thread.sleep(100)
+          require(killSignal.exists(), "timed out waiting for worker-killed signal from orchestrator")
+          println("RESUME-POC-E2E RUN-KILL worker-killed signal received -- resuming AQE " +
+            "replanning/execution now (expect a fetch failure downstream, map-stage resubmit, " +
+            "then a correct result)")
+        }
+        val hook = new E2EStageHook(spark.sparkContext, store, QUERY_ID, HookMode.Adopt, onAdopted)
+        ResumeHooks.stage = Some(hook)
+        val counter = new TaskCounter
+        spark.sparkContext.addSparkListener(counter)
+        try {
+          val rows = query(spark, base).collect()
+          val adopted = hook.events.collect { case e: StageAdopted => e.digest }
+          println(s"RESUME-POC-E2E RUN-KILL tasksRun=${counter.count} stagesAdopted=${adopted.size}")
+          require(adopted.nonEmpty,
+            "expected the fact-side stage to be adopted (worker must be alive at adopt time for " +
+              "this test to mean anything) -- see hook.events for the miss/reject reason")
+          println("RESUME-POC-E2E RUN-KILL ADOPT-CONFIRMED-ALIVE")
+          checkResult(rows)
+          println("RESUME-POC-E2E RUN-KILL OK-RECOMPUTED-AFTER-FETCH-FAILURE")
         } finally {
           hook.close()
           ResumeHooks.stage = None
