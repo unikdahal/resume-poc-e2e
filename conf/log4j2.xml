@@ -8,6 +8,13 @@
         </Console>
     </Appenders>
     <Loggers>
+        <!-- DEBUG here, not just INFO: OptimizeSkewedJoin's own logDebug calls (size-info dumps,
+             skewed-partition counts) are the fastest way to see WHY AQE did or didn't skew-split
+             a given run, without patching Spark to add printlns for a question this project only
+             needs to answer once. -->
+        <Logger name="org.apache.spark.sql.execution.adaptive" level="DEBUG" additivity="false">
+            <AppenderRef ref="stdout"/>
+        </Logger>
         <Root level="INFO">
             <AppenderRef ref="stdout"/>
         </Root>

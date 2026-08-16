@@ -110,8 +110,59 @@ object Demo {
     override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = synchronized { count += 1 }
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Skew scenario (see SkewGuard.scala's doc comment for why this exists and what it checks):
+  // does adopting a shuffle stage whose consumer later skew-splits it produce a CORRECT result,
+  // given the fabricated per-mapper size distribution `MapOutputTrackerAccess.seedAdopted` feeds
+  // AQE (real total on mapper 0, 1-byte placeholders elsewhere)? And separately: does capturing
+  // this shuffle's anchor BEFORE its own consumer skew-reads it (which re-sorts the underlying
+  // Celeborn file) leave rung 7.5's later freshness probe -- always a WHOLE-file request -- still
+  // able to compute the correct total length against that now-sorted file? Same fixture answers
+  // both questions, per the advisor's suggestion. Recipe unchanged from resume-poc's `SkewDemo`.
+  val SKEW_QUERY_ID = "resume-poc-e2e-skew-demo"
+  val SKEW_EXPECTED_COUNT = 30008L
+
+  def newSkewSession(masterEndpoint: String, appUniqueId: String): SparkSession =
+    SparkSession.builder().appName("resume-poc-e2e-skew")
+      .master("local[4]")
+      .config("spark.shuffle.manager", "org.apache.spark.shuffle.celeborn.SparkShuffleManager")
+      .config("spark.shuffle.service.enabled", "false")
+      .config("spark.celeborn.master.endpoints", masterEndpoint)
+      .config("spark.celeborn.client.application.uniqueId", appUniqueId)
+      .config("spark.celeborn.client.application.uuidSuffix.enabled", "false")
+      .config("spark.celeborn.client.spark.stageRerun.enabled", "true")
+      .config("spark.celeborn.client.push.replicate.enabled", "false")
+      .config("spark.celeborn.master.heartbeat.application.timeout", "600s")
+      .config("spark.sql.adaptive.localShuffleReader.enabled", "false")
+      .config("spark.sql.shuffle.partitions", "4")
+      .config("spark.sql.adaptive.enabled", "true")
+      .config("spark.sql.adaptive.skewJoin.enabled", "true")
+      // Same reasoning as SkewDemo: coalescing off avoids noise, small thresholds trip real
+      // skew detection on demo-sized data, force SortMergeJoin (OptimizeSkewedJoin only rewrites
+      // SortMergeJoinExec).
+      .config("spark.sql.adaptive.coalescePartitions.enabled", "false")
+      .config("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "100")
+      .config("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "2")
+      .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "100")
+      .config("spark.sql.autoBroadcastJoinThreshold", "-1")
+      .config("spark.sql.join.preferSortMergeJoin", "true")
+      .getOrCreate()
+
+  /** `big`'s own shuffle exchange is the stage this project captures/adopts -- analogous to
+    * `fact` in the main demo. Key 0 gets 30000 rows; keys 1-7 get 8 rows total -- an extreme,
+    * obvious skew ratio, same as `SkewDemo`, so the point is tripping real AQE skew detection,
+    * not finding the minimum ratio that does. */
+  def skewedJoin(spark: SparkSession): DataFrame = {
+    import spark.implicits._
+    val bigKeys = (0 until 30000).map(_ => 0) ++ (0 until 8).map(i => 1 + i % 7)
+    val big = bigKeys.zipWithIndex.map { case (k, i) => (k, i.toLong, s"payload-$i-${"x" * 200}") }
+      .toDF("k", "v", "payload")
+    val small = (0 until 8).map(i => (i, s"name$i")).toDF("k", "name")
+    big.join(small, "k").agg(count("*"))
+  }
+
   def main(args: Array[String]): Unit = {
-    val mode = args(0) // setup | capture | adopt | adopt-cold
+    val mode = args(0) // setup | capture | adopt | adopt-cold | skew-capture | skew-adopt
     val base = args(1)
     // args(2) is the anchor-store directory, required for capture/adopt (setup writes no
     // anchors and doesn't need one). args(3), if present, overrides the Celeborn master
@@ -200,6 +251,80 @@ object Demo {
             s"adopt-cold is supposed to be a COLD baseline (empty anchor store) -- something " +
               s"got adopted anyway: $adopted -- is args(2) really empty?")
           println(s"RESUME-POC-E2E ADOPT-COLD tasksRun=${counter.count} result=OK")
+        } finally {
+          hook.close()
+          ResumeHooks.stage = None
+          spark.stop()
+        }
+
+      // See this file's "Skew scenario" section and SkewGuard.scala's doc comment for what this
+      // pair of modes checks and why it's a post-hoc plan check rather than a pre-adoption
+      // rejection. skew-capture: real run, hook captures big's shuffle stage BEFORE the join
+      // consumes it (which may skew-split-read it, re-sorting the underlying Celeborn file --
+      // exactly the scenario rung 7.5's freshness probe must survive later). halt(0), same
+      // reasoning as `capture`.
+      case "skew-capture" =>
+        val store = new FileAnchorStore(new File(args(2)))
+        val spark = newSkewSession(masterEndpoint, SKEW_QUERY_ID)
+        val hook = new E2EStageHook(spark.sparkContext, store, SKEW_QUERY_ID, HookMode.Capture)
+        ResumeHooks.stage = Some(hook)
+        try {
+          val df = skewedJoin(spark)
+          val rows = df.collect()
+          val count = rows.head.getLong(0)
+          require(count == SKEW_EXPECTED_COUNT, s"skew-capture result mismatch: got=$count expected=$SKEW_EXPECTED_COUNT")
+          val captured = hook.events.collect { case e: StageCaptured => e.digest }
+          val skewedDuringCapture = SkewGuard.hasSkewPartitionSpecs(df.queryExecution.executedPlan)
+          println(s"RESUME-POC-E2E SKEW-CAPTURE result=OK count=$count " +
+            s"stagesCaptured=${captured.size} digests=${captured.mkString(",")} " +
+            s"skewedDuringCapture=$skewedDuringCapture")
+        } finally {
+          hook.close()
+          ResumeHooks.stage = None
+        }
+        Runtime.getRuntime.halt(0)
+
+      // Second JVM, SAME skewed query. Proves, in one run: (1) rung 7.5's freshness probe does
+      // NOT falsely reject an anchor whose underlying file capture's OWN later consumption
+      // already re-sorted (a whole-file probe against a sorted file, exercised for real, not
+      // reasoned about from source alone -- see design-aqe-and-corrupted-rerun.md S2's "sorted
+      // file" open item); (2) the adopted stage's fabricated per-mapper stats
+      // (`seedAdopted`'s doc comment) do not corrupt the result when AQE skew-splits it using
+      // them, confirming `ShufflePartitionsUtil.createSkewPartitionSpecs`'s full-mapper-range
+      // coverage guarantee (verified from source in SkewGuard.scala's doc comment) empirically,
+      // not just structurally.
+      case "skew-adopt" =>
+        val store = new FileAnchorStore(new File(args(2)))
+        val spark = newSkewSession(masterEndpoint, SKEW_QUERY_ID)
+        val hook = new E2EStageHook(spark.sparkContext, store, SKEW_QUERY_ID, HookMode.Adopt)
+        ResumeHooks.stage = Some(hook)
+        try {
+          val df = skewedJoin(spark)
+          val rows = df.collect()
+          val adopted = hook.events.collect { case e: StageAdopted => e.digest }
+          val rejected = hook.events.collect { case e: StageRejected => e }
+          val missed = hook.events.collect { case e: StageMissNoAnchor => e.digest }
+          val plan = df.queryExecution.executedPlan
+          val skewedThisRun = SkewGuard.hasSkewPartitionSpecs(plan)
+          // Printed before the correctness/adoption requires, same reasoning as `adopt`: these
+          // diagnostics must survive an assertion failure, not be lost to it.
+          println(s"RESUME-POC-E2E SKEW-ADOPT stagesAdopted=${adopted.size} " +
+            s"digests=${adopted.mkString(",")} missed=${missed.mkString(",")} " +
+            s"rejected=${rejected.mkString(";")} skewedThisRun=$skewedThisRun")
+          println(s"RESUME-POC-E2E SKEW-ADOPT plan=\n${plan.toString.take(4000)}")
+          require(adopted.nonEmpty,
+            "expected big's shuffle stage to be adopted -- if it was CELEBORN_STALE, that is " +
+              "exactly the false-positive this scenario exists to catch (rung 7.5 vs. a file " +
+              "sorted by this anchor's own capture-time consumption) -- see rejected= above")
+          require(skewedThisRun,
+            "expected AQE to skew-split the adopted stage in THIS run too -- if it didn't, this " +
+              "scenario never actually exercised the fabricated-per-mapper-stats risk, and a " +
+              "passing result below would not mean what this test claims it means")
+          val count = rows.head.getLong(0)
+          require(count == SKEW_EXPECTED_COUNT, s"skew-adopt result mismatch: got=$count expected=$SKEW_EXPECTED_COUNT " +
+            "-- this is the failure mode this scenario exists to catch: a skew-split read against " +
+            "an adopted stage's fabricated per-mapper stats producing a wrong answer")
+          println(s"RESUME-POC-E2E SKEW-ADOPT result=OK count=$count")
         } finally {
           hook.close()
           ResumeHooks.stage = None

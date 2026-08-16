@@ -178,6 +178,28 @@ check "adopt run's plan actually took a DIFFERENT downstream join strategy than 
   "$(grep -q 'BroadcastHashJoin' "$LOG_DIR/adopt.log" && echo true || echo false)"
 
 echo
+echo "== SKEW-CAPTURE: real skewed join, big's shuffle stage captured before its own consumer skew-reads it =="
+run_demo skew-capture "$TABLES_DIR" "$ANCHOR_DIR" "$MASTER_ENDPOINT" 2>&1 | tee "$LOG_DIR/skew-capture.log" | grep --line-buffered "RESUME-POC-E2E"
+grep -q "RESUME-POC-E2E SKEW-CAPTURE .*result=OK" "$LOG_DIR/skew-capture.log"
+
+echo
+echo "== SKEW-ADOPT: second JVM, SAME skewed query -- rung 7.5 vs. a since-sorted file, skew-split vs. fabricated per-mapper stats =="
+run_demo skew-adopt "$TABLES_DIR" "$ANCHOR_DIR" "$MASTER_ENDPOINT" 2>&1 | tee "$LOG_DIR/skew-adopt.log" | grep --line-buffered "RESUME-POC-E2E"
+grep -q "RESUME-POC-E2E SKEW-ADOPT result=OK" "$LOG_DIR/skew-adopt.log"
+
+check "skew-capture's own join consumption actually skew-split the captured stage (the scenario this fixture exists to create actually occurred)" \
+  "$(grep -oP 'skewedDuringCapture=\K\S+' "$LOG_DIR/skew-capture.log" | grep -q true && echo true || echo false)"
+
+check "skew-adopt: the shuffle stage was adopted despite its file having been sorted by capture's own consumption (rung 7.5 did NOT false-reject)" \
+  "$(grep -q 'RESUME-POC-E2E SKEW-ADOPT stagesAdopted=0' "$LOG_DIR/skew-adopt.log" && echo false || echo true)"
+
+check "skew-adopt: AQE skew-split the ADOPTED stage in this run too (the fabricated-per-mapper-stats risk was actually exercised, not sidestepped)" \
+  "$(grep -oP 'skewedThisRun=\K\S+' "$LOG_DIR/skew-adopt.log" | grep -q true && echo true || echo false)"
+
+check "skew-adopt produced the CORRECT count despite a skew-split read against fabricated per-mapper stats (the full-mapper-range-coverage guarantee holds in practice, not just by source reading)" \
+  "$(grep -q 'RESUME-POC-E2E SKEW-ADOPT result=OK' "$LOG_DIR/skew-adopt.log" && echo true || echo false)"
+
+echo
 echo "== summary: $pass passed, $fail failed =="
 echo "logs kept at: $LOG_DIR"
 [ "$fail" -eq 0 ]

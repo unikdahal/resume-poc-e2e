@@ -12,7 +12,8 @@ underneath it, because a real `StageDigest` matched. This project is that combin
 
 Run `./run-e2e-demo.sh` (needs `../spark` built as `3.5.10-SNAPSHOT` and `../celeborn` built as
 `1.0.0-SNAPSHOT` -- see `pom.xml`'s header comment for the exact build commands, same
-prerequisites `resume-poc` and `resume-poc-sql` each already need separately). 5/5 checks pass:
+prerequisites `resume-poc` and `resume-poc-sql` each already need separately). 9/9 checks pass,
+two query shapes:
 
 1. **Correctness.** The adopted run's result matches an independently (non-Spark) computed
    expected value.
@@ -36,8 +37,18 @@ prerequisites `resume-poc` and `resume-poc-sql` each already need separately). 5
    of the join, which can't reach back and change it); the join's own shuffle stage(s), which
    *are* affected, are simply never looked up on the `adopt` side, because a broadcast join has no
    join-side shuffle stage to look up.
+6. **rung 8's real danger, both halves, empirically -- not just reasoned about (`skew-capture`/
+   `skew-adopt` modes, see `SkewGuard.scala`'s doc comment for the full account).** A real
+   AQE-skewed join (`SkewDemo`'s recipe, ported from `resume-poc`): one key holds 30000 of 30008
+   rows. `skew-capture` captures the skewed side's shuffle stage BEFORE its own join consumption
+   skew-reads it (which re-sorts the underlying Celeborn file). `skew-adopt`, second JVM, same
+   query, checks: (a) rung 7.5's freshness probe does NOT false-reject an anchor whose file was
+   sorted by capture's own later, unrelated consumption; (b) AQE genuinely skew-splits the
+   ADOPTED stage using `MapOutputTrackerAccess.seedAdopted`'s fabricated per-mapper stats; (c) the
+   result is still correct. (b) failed the first time this was run -- see the bug below -- and (c)
+   would have been meaningless if (b) hadn't first been forced to genuinely happen.
 
-## Two real bugs found building this, not anticipated by design
+## Three real bugs found building this, not anticipated by design
 
 Both are documented in depth at their call sites (`CelebornAdoption.waitStageEnd`,
 `E2EStageHook.adoptAnchor`, `ShuffleAnchor.dataSize`/`rowCount`, and the `StageResumeHook` trait
@@ -66,20 +77,42 @@ doc comment in `../spark`) -- summarized here:
    `StageResumeHook` trait's own doc comment in `../spark` -- it previously implied
    `MapOutputStatistics` alone was sufficient, which is what led to writing this bug in the first
    place.
+3. **`seedAdopted`'s fabricated per-mapper split (real total on mapper 0, 1-byte placeholders
+   elsewhere) silently defeated AQE's skew-splitting for every adopted shuffle.** Not a
+   correctness bug (see `SkewGuard.scala`'s doc comment for why full-mapper-range coverage is
+   structurally guaranteed regardless) -- a silent LOSS of the optimization, and worse, a silent
+   loss of test coverage: `skew-adopt`'s first run showed `skewedDuringCapture=true` but
+   `skewedThisRun=false` on the identical query's adopted rerun, because `OptimizeSkewedJoin`'s
+   own small-partition-merging logic collapsed the near-zero placeholder mappers back into the
+   one real chunk and concluded there was nothing worth splitting. The scenario this test exists
+   to exercise was never actually entered. Fixed in `MapOutputTrackerAccess.seedAdopted` by
+   spreading each partition's real total EVENLY across all mapper slots instead of dumping it on
+   one -- strictly better on two axes, not a trade-off: `getStatistics`'s per-partition sum
+   becomes exact (no more placeholder-noise overcounting), and the per-mapper shape now resembles
+   a real distribution closely enough for `OptimizeSkewedJoin` to find a genuine split. With the
+   fix, `skew-adopt` reliably reproduces `skewedThisRun=true` and a correct result.
 
 ## What this still does not prove
 
-- **Only one query shape, one hook implementation, one small local cluster.** Not a stress test,
-  not a skew scenario, not a real multi-stage query with many adoptable stages at once.
+- **Rung 8's skew check is a POST-HOC detector, not a pre-adoption gate, and there is no sound way
+  to make it one.** `hasSkewPartitionSpecs` runs on the run's final converged plan, after real
+  execution -- it can tell you a skew split against an adopted stage happened and was correct, but
+  it cannot refuse an adoption in advance on the suspicion that a later consumer MIGHT skew-split
+  it, because the information needed to know that doesn't exist at `tryAdoptShuffleStage` time
+  (see `SkewGuard.scala`'s doc comment). This project treats that as acceptable given the
+  structural + empirical safety proof, not as a gap it papers over -- but it means there is still
+  no coordinator anywhere in this whole effort that REJECTS an adoption for skew reasons; there is
+  only a fact-check after the fact.
 - **Only `ShuffleExchangeExec` is handled** (`stage.shuffle match { case s: ShuffleExchangeExec =>
   ...}`); a `ReusedExchangeExec`-wrapped stage falls through to "not adopted, recompute" via
   `shuffleExchangeOf`'s `None` case, untested here.
-- **`dataSize`/`rowCount` are whole-stage totals, not per-partition.** Sufficient for
-  `AQEPropagateEmptyRelation`'s row-count check (what this demo actually hit and fixed); untested
-  against `CoalesceShufflePartitions`/`OptimizeSkewedJoin`, which read the PER-PARTITION
-  `bytesByPartitionId` this project does supply (via `CelebornAdoption.partitionByteSizes`, with
-  the same "+`numMaps`-1 placeholder noise" approximation `resume-poc` already documents and
-  accepts) -- whether that's precise enough for skew-aware replanning specifically is open.
+- **`dataSize`/`rowCount` (the `AQEPropagateEmptyRelation` fix) are whole-stage totals, not
+  per-partition.** `bytesByPartitionId` (the PER-PARTITION granularity `OptimizeSkewedJoin`'s
+  skew-detection actually reads, now proven to work end-to-end above) and the per-MAPPER split
+  within it (`seedAdopted`, now spread evenly, also proven to work end-to-end above) are both
+  exercised for real. What's still untested: `CoalesceShufflePartitions`, a different AQE rule
+  that also reads per-partition sizes, for a different purpose (merging small partitions rather
+  than splitting large ones) -- no test here specifically targets it.
 - **`waitStageEnd` is bounded** by `celeborn.client.push.stageEnd.timeout` and this project
   captures anyway on timeout, producing a deliberately-empty anchor that will simply fail to match
   or fail rung 7.5 later (safe under A-1, not silently wrong) -- but a capture that always times
@@ -92,5 +125,7 @@ doc comment in `../spark`) -- summarized here:
   test's finding -- Spark's own fetch-failure recovery is the real safety net -- is inherited by
   construction (same underlying mechanism) but not re-verified against this specific SQL/AQE
   pipeline.
-- **Rung 8's skew-spec half (`SkewGuard.hasSkewPartitionSpecs`) is still not wired in anywhere,**
-  including here -- this demo's query has no skew.
+- **Two query shapes now (a groupBy/join with differing downstream strategy, and a skewed join),
+  one hook implementation, one small local cluster.** Not a stress test, not a real multi-stage
+  query with many simultaneously-adoptable stages, not a load test of `BATCH_OPEN_STREAM` fan-out
+  at realistic partition counts.
