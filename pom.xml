@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The combined end-to-end demo: AQE-optimized SQL, per-stage adoption (design note S1's
+  StageResumeHook + StageDigest), real Celeborn-backed shuffle bytes surviving a real driver
+  restart (design note S2's rung 7.5 freshness check), all three in one process pair, which
+  neither resume-poc (Celeborn bytes, no AQE/SQL) nor resume-poc-sql (AQE/SQL hooks, no Celeborn)
+  proves alone. See docs/APPROACH-AND-COVERAGE.md, "no combined AQE+SQL+Celeborn" gap, and
+  README.md in this directory for what this closes and what it still doesn't.
+
+  Needs BOTH from-source builds resume-poc and resume-poc-sql each need separately:
+    - ../spark built as 3.5.10-SNAPSHOT (ResumeHooks.StageResumeHook does not exist upstream):
+        cd ../spark && ./build/mvn -Pscala-2.12 \
+          -pl core,sql/catalyst,sql/core,common/network-common,common/network-shuffle,common/unsafe,common/tags,launcher \
+          -am install -DskipTests -o
+    - ../celeborn built as 1.0.0-SNAPSHOT (LifecycleManager.adoptShuffle/confirmAlive does not
+      exist upstream):
+        cd ../celeborn && mvn -Pspark-3.5 -DskipTests \
+          -pl common,client,service,master,worker,client-spark/common,client-spark/spark-3,client-spark/spark-3-shaded -am \
+          install
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.apache.spark.resume.poc</groupId>
+  <artifactId>resume-poc-e2e_2.12</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <scala.version>2.12.18</scala.version>
+    <scala.binary.version>2.12</scala.binary.version>
+    <spark.version>3.5.10-SNAPSHOT</spark.version>
+    <celeborn.version>1.0.0-SNAPSHOT</celeborn.version>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+      <version>${scala.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-core_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.celeborn</groupId>
+      <artifactId>celeborn-client-spark-3-shaded_${scala.binary.version}</artifactId>
+      <version>${celeborn.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+        <version>4.9.2</version>
+        <executions>
+          <execution>
+            <goals>
+              <goal>compile</goal>
+            </goals>
+          </execution>
+        </executions>
+        <configuration>
+          <scalaVersion>${scala.version}</scalaVersion>
+          <args>
+            <arg>-target:17</arg>
+          </args>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <execution>
+            <id>build-classpath</id>
+            <phase>package</phase>
+            <goals>
+              <goal>build-classpath</goal>
+            </goals>
+            <configuration>
+              <outputFile>${project.build.directory}/classpath.txt</outputFile>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
